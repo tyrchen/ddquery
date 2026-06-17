@@ -1,21 +1,29 @@
 [package]
 name = "ddquery-core"
 description = """
-
+A pure-Rust parser and explainer for Datadog monitor queries: tokenize a raw \
+monitor query into a typed, serializable AST, then render it to JSON or a \
+plain-language summary.
 """
-categories = ["development-tools"]
-keywords = []
+categories = ["development-tools", "parser-implementations"]
+keywords = ["datadog", "monitor", "query", "parser", "observability"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
-documentation.workspace = true
+documentation = "https://docs.rs/ddquery-core"
 repository.workspace = true
 homepage.workspace = true
+readme.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+proptest.workspace = true
+rstest.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
+
+[lints]
+workspace = true

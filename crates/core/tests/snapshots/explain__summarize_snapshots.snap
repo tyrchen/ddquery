@@ -1,0 +1,137 @@
+---
+source: crates/core/tests/explain.rs
+expression: summaries
+---
+[
+  [
+    "simple_threshold",
+    {
+      "headline": "Threshold alert on system.cpu.user",
+      "metric": "system.cpu.user",
+      "scope": [
+        {
+          "key": "env",
+          "value": "production"
+        },
+        {
+          "key": "service",
+          "value": "web"
+        }
+      ],
+      "groupBy": [],
+      "window": "last 5 minutes",
+      "condition": "> 90",
+      "raw": "avg(last_5m):avg:system.cpu.user{env:production, service:web} > 90"
+    }
+  ],
+  [
+    "anomaly_flagship",
+    {
+      "headline": "Anomaly detection on app.service.latency",
+      "metric": "app.service.latency",
+      "scope": [
+        {
+          "key": "platform",
+          "value": "macos"
+        },
+        {
+          "key": "country",
+          "value": "us"
+        }
+      ],
+      "groupBy": [],
+      "window": "last 1 day",
+      "evaluation": "anomaly detection (algorithm agile, ~5σ, direction below, daily seasonality)",
+      "condition": "≥ 1",
+      "raw": "avg(last_1d):anomalies(sum:app.service.latency{platform:macos , country:us}.as_count(), 'agile', 5, direction='below', interval=300, seasonality='daily') >= 1"
+    }
+  ],
+  [
+    "outlier_nested",
+    {
+      "headline": "Outlier detection on app.service.requests",
+      "metric": "app.service.requests",
+      "scope": [],
+      "groupBy": [
+        "host"
+      ],
+      "window": "last 5 minutes",
+      "evaluation": "outlier detection (algorithm DBSCAN, tolerance 3)",
+      "condition": "≥ 1",
+      "raw": "avg(last_5m):outliers(median_5(sum:app.service.requests{*} by {host}.as_count()), 'DBSCAN', 3) >= 1"
+    }
+  ],
+  [
+    "arithmetic_ratio",
+    {
+      "headline": "Threshold alert on app.service.errors",
+      "metric": "app.service.errors",
+      "scope": [],
+      "groupBy": [],
+      "window": "last 5 minutes",
+      "condition": "> 5",
+      "raw": "sum(last_5m):(sum:app.service.errors{*}.as_count() / sum:app.service.requests{*}.as_count()) * 100 > 5"
+    }
+  ],
+  [
+    "change_metric",
+    {
+      "headline": "Change on system.load.1",
+      "metric": "system.load.1",
+      "scope": [],
+      "groupBy": [],
+      "window": "last 5 minutes",
+      "evaluation": "change over last 1 hour",
+      "condition": "> 10",
+      "raw": "change(avg(last_5m),last_1h):avg:system.load.1{*} > 10"
+    }
+  ],
+  [
+    "log_search",
+    {
+      "headline": "Log search",
+      "metric": "status:error @http.status_code:403",
+      "scope": [],
+      "groupBy": [
+        "service"
+      ],
+      "window": "5m",
+      "evaluation": "rollup count",
+      "condition": "> 100",
+      "raw": "logs(\"status:error @http.status_code:403\").index(\"main\").rollup(\"count\").by(\"service\").last(\"5m\") > 100"
+    }
+  ],
+  [
+    "service_check",
+    {
+      "headline": "Service check `datadog.agent.up`",
+      "scope": [],
+      "groupBy": [
+        "host"
+      ],
+      "condition": "last 3 runs by status",
+      "raw": "\"datadog.agent.up\".over(\"env:prod\").by(\"host\").last(3).count_by_status()"
+    }
+  ],
+  [
+    "slo_error_budget",
+    {
+      "headline": "SLO error budget `slo-123`",
+      "scope": [],
+      "groupBy": [],
+      "window": "7d",
+      "condition": "> 0.5",
+      "raw": "error_budget(\"slo-123\").over(\"7d\") > 0.5"
+    }
+  ],
+  [
+    "composite",
+    {
+      "headline": "Composite monitor",
+      "scope": [],
+      "groupBy": [],
+      "condition": "((#123 && !#456) || #789)",
+      "raw": "123 && !456 || 789"
+    }
+  ]
+]

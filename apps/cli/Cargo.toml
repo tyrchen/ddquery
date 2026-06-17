@@ -1,0 +1,28 @@
+[package]
+name = "ddquery-cli"
+description = """
+A small command-line front-end over `ddquery-core`: parse a Datadog monitor query and print its explanation, structured summary, and AST.
+"""
+categories = ["command-line-utilities", "parser-implementations"]
+keywords = ["datadog", "monitor", "query", "parser", "observability"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+documentation = "https://docs.rs/ddquery-cli"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "ddquery"
+path = "src/main.rs"
+
+[dependencies]
+ddquery-core.workspace = true
+anyhow.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+
+[lints]
+workspace = true

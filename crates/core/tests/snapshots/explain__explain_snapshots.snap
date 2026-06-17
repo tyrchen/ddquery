@@ -1,0 +1,39 @@
+---
+source: crates/core/tests/explain.rs
+expression: "rendered.join(\"\\n\\n\")"
+---
+[simple_threshold]
+avg(last_5m):avg:system.cpu.user{env:production, service:web} > 90
+→ Alert if the average over the 5 minutes of avg of `system.cpu.user` (env:production, service:web) is > 90.
+
+[anomaly_flagship]
+avg(last_1d):anomalies(sum:app.service.latency{platform:macos , country:us}.as_count(), 'agile', 5, direction='below', interval=300, seasonality='daily') >= 1
+→ Alert if the average over the 1 day of anomaly detection (algorithm agile, ~5σ, direction below, daily seasonality) (sum of `app.service.latency` (platform:macos, country:us)) is ≥ 1.
+
+[outlier_nested]
+avg(last_5m):outliers(median_5(sum:app.service.requests{*} by {host}.as_count()), 'DBSCAN', 3) >= 1
+→ Alert if the average over the 5 minutes of outlier detection (algorithm DBSCAN, tolerance 3) (5-point median of sum of `app.service.requests` by host) is ≥ 1.
+
+[arithmetic_ratio]
+sum(last_5m):(sum:app.service.errors{*}.as_count() / sum:app.service.requests{*}.as_count()) * 100 > 5
+→ Alert if the sum over the 5 minutes of ((sum of `app.service.errors` ÷ sum of `app.service.requests`) × 100) is > 5.
+
+[change_metric]
+change(avg(last_5m),last_1h):avg:system.load.1{*} > 10
+→ Alert if the average over the 5 minutes of change over last 1 hour of avg of `system.load.1` is > 10.
+
+[log_search]
+logs("status:error @http.status_code:403").index("main").rollup("count").by("service").last("5m") > 100
+→ Over 5m, count log events matching `status:error @http.status_code:403`, grouped by service (rollup count), alert > 100.
+
+[service_check]
+"datadog.agent.up".over("env:prod").by("host").last(3).count_by_status()
+→ Evaluates the status of service check `datadog.agent.up` over its last 3 runs grouped by host.
+
+[slo_error_budget]
+error_budget("slo-123").over("7d") > 0.5
+→ Alerts when the error budget for SLO `slo-123` over 7d is > 0.5.
+
+[composite]
+123 && !456 || 789
+→ Alerts when this boolean condition over other monitors holds: ((#123 && !#456) || #789).
