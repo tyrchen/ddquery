@@ -85,15 +85,27 @@ pub enum MetricExpr {
         /// Positional and keyword parameters.
         params: Vec<FuncParam>,
     },
-    /// A transform such as `rollup` / `clamp_min` / `median_N` / `abs`.
+    /// A transform such as `rollup` / `clamp_min` / `median_N` / `abs` /
+    /// `moving_rollup`.
     #[serde(rename_all = "camelCase")]
     Transform {
         /// Transform name (kept verbatim, e.g. `median_5`).
         name: String,
         /// The inner expression being transformed.
         arg: Box<MetricExpr>,
-        /// Scalar arguments to the transform.
-        args: Vec<Scalar>,
+        /// Arguments to the transform. Most are numeric (e.g. `rollup(60)`), but
+        /// some carry strings — e.g. `moving_rollup(expr, 60, 'avg')`.
+        args: Vec<ParamValue>,
+    },
+    /// A spatial combiner over several sub-expressions, e.g.
+    /// `max(avg:a{*}, avg:b{*})`. `name` is the aggregator token
+    /// (`max`/`min`/`sum`/`avg`/`count`).
+    #[serde(rename_all = "camelCase")]
+    Combine {
+        /// The aggregator token combining the operands.
+        name: String,
+        /// The combined sub-expressions (two or more in practice).
+        args: Vec<MetricExpr>,
     },
     /// Arithmetic: `a + b`, `a / b * 100`, etc.
     #[serde(rename_all = "camelCase")]
@@ -298,13 +310,24 @@ pub struct Window {
 impl Window {
     /// Parse and normalize a window token such as `last_5m` or `5m`.
     ///
-    /// Returns `None` if the token is not a recognized `<number><unit>` form
-    /// (with units `s`, `m`, `h`, `d`, `w`).
+    /// Recognized prefixes are `last_` (the default) and `current_` (the
+    /// in-progress period, e.g. `current_1d`). Recognized units are `s`, `m`,
+    /// `h`, `d`, `w`, and `mo` (month, normalized to 30 days). Returns `None`
+    /// if the token is not a recognized `<prefix><number><unit>` form.
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
-        let body = raw.strip_prefix("last_").unwrap_or(raw);
+        // `current_<n><unit>` describes the in-progress period; for length
+        // purposes it normalizes identically to `last_<n><unit>`. We keep the
+        // verbatim `raw` so the distinction survives for display.
+        let (body, prefix_word) = if let Some(rest) = raw.strip_prefix("last_") {
+            (rest, "last")
+        } else if let Some(rest) = raw.strip_prefix("current_") {
+            (rest, "current")
+        } else {
+            (raw, "last")
+        };
         let (digits, unit) = body.split_at(body.find(|c: char| !c.is_ascii_digit())?);
-        if digits.is_empty() || unit.len() != 1 {
+        if digits.is_empty() {
             return None;
         }
         let count: u64 = digits.parse().ok()?;
@@ -314,6 +337,7 @@ impl Window {
             "h" => (3600, "hour"),
             "d" => (86_400, "day"),
             "w" => (604_800, "week"),
+            "mo" => (2_592_000, "month"), // 30 days, matching Datadog
             _ => return None,
         };
         let seconds = count.checked_mul(secs_per)?;
@@ -321,7 +345,7 @@ impl Window {
         Some(Self {
             raw: raw.to_string(),
             seconds,
-            display: format!("last {count} {unit_name}{plural}"),
+            display: format!("{prefix_word} {count} {unit_name}{plural}"),
         })
     }
 }
@@ -455,17 +479,67 @@ str_enum! {
         Min => "min",
         Max => "max",
         Count => "count",
+        Percentile => "percentile",
     }
 }
 
-str_enum! {
-    /// Spatial aggregation across reporting sources.
-    SpaceAgg {
-        Avg => "avg",
-        Sum => "sum",
-        Min => "min",
-        Max => "max",
-        Count => "count",
+/// Spatial aggregation across reporting sources.
+///
+/// Besides the named aggregators, Datadog allows a percentile selector such as
+/// `p95:` / `p99.9:`, which we keep as [`SpaceAgg::Percentile`] carrying the
+/// percentile rank verbatim (e.g. `"95"`, `"99.9"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SpaceAgg {
+    /// `avg`
+    Avg,
+    /// `sum`
+    Sum,
+    /// `min`
+    Min,
+    /// `max`
+    Max,
+    /// `count`
+    Count,
+    /// A percentile selector, e.g. `p95` → `Percentile("95")`. The rank is kept
+    /// as text so fractional percentiles (`p99.9`) round-trip losslessly.
+    Percentile(String),
+}
+
+impl SpaceAgg {
+    /// Parse from the source token, returning `None` if unrecognized.
+    ///
+    /// Recognizes the named aggregators and percentile tokens `p<rank>`, where
+    /// `<rank>` is a number 0–100 (optionally fractional), e.g. `p95`, `p99.9`.
+    #[must_use]
+    pub fn from_token(s: &str) -> Option<Self> {
+        match s {
+            "avg" => Some(Self::Avg),
+            "sum" => Some(Self::Sum),
+            "min" => Some(Self::Min),
+            "max" => Some(Self::Max),
+            "count" => Some(Self::Count),
+            _ => {
+                let rank = s.strip_prefix('p')?;
+                let value: f64 = rank.parse().ok()?;
+                (0.0..=100.0)
+                    .contains(&value)
+                    .then(|| Self::Percentile(rank.to_string()))
+            }
+        }
+    }
+}
+
+impl ::std::fmt::Display for SpaceAgg {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Avg => f.write_str("avg"),
+            Self::Sum => f.write_str("sum"),
+            Self::Min => f.write_str("min"),
+            Self::Max => f.write_str("max"),
+            Self::Count => f.write_str("count"),
+            Self::Percentile(rank) => write!(f, "p{rank}"),
+        }
     }
 }
 
@@ -510,6 +584,7 @@ str_enum! {
         Ge => ">=",
         Le => "<=",
         Eq => "==",
+        Ne => "!=",
         Gt => ">",
         Lt => "<",
     }

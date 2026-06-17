@@ -3,7 +3,7 @@
 
 use ddquery_core::{
     ArithOp, ChangeKind, CmpOp, CompositeExpr, Filter, FuncKind, MetricExpr, MonitorQuery,
-    ParamValue, SearchSource, parse, parse_or_unparsed,
+    ParamValue, SearchSource, SpaceAgg, parse, parse_or_unparsed,
 };
 use rstest::rstest;
 
@@ -27,7 +27,7 @@ fn test_should_parse_simple_metric_query() {
         panic!("expected a series expression");
     };
     assert_eq!(series.metric, "system.cpu.user");
-    assert_eq!(series.space_aggregation.as_token(), "avg");
+    assert_eq!(series.space_aggregation, SpaceAgg::Avg);
     assert_eq!(
         series.filter,
         vec![Filter::Tag {
@@ -314,4 +314,136 @@ fn test_should_serialize_ast_to_camel_case_json() {
     assert_eq!(series["spaceAggregation"], "avg");
     assert_eq!(series["groupBy"][0], "host");
     assert_eq!(json["metric"]["timeAggregation"], "avg");
+}
+
+// ----- optional space aggregation (defaults to avg) ------------------------
+
+#[rstest]
+#[case(
+    "avg(last_5m):aws.rds.cpuutilization{service:content} > 60",
+    "aws.rds.cpuutilization"
+)]
+#[case(
+    "max(last_15m):system.disk.in_use{host:db}*100 > 80",
+    "system.disk.in_use"
+)]
+#[case(
+    "avg(last_5m):tubi.grpc.server.handled_total{*} > 1",
+    "tubi.grpc.server.handled_total"
+)]
+fn test_should_default_space_aggregation_when_prefix_omitted(
+    #[case] query: &str,
+    #[case] expected_metric: &str,
+) {
+    let m = metric(query);
+    let series = first_series(&m.expr);
+    assert_eq!(series.metric, expected_metric);
+    assert_eq!(series.space_aggregation, SpaceAgg::Avg);
+}
+
+/// Find the first series in an expression tree (mirrors the explain helper).
+fn first_series(expr: &MetricExpr) -> &ddquery_core::Series {
+    fn walk(expr: &MetricExpr) -> Option<&ddquery_core::Series> {
+        match expr {
+            MetricExpr::Series(s) => Some(s),
+            MetricExpr::Function { arg, .. }
+            | MetricExpr::Transform { arg, .. }
+            | MetricExpr::Change { arg, .. } => walk(arg),
+            MetricExpr::Combine { args, .. } => args.iter().find_map(walk),
+            MetricExpr::Arith { lhs, rhs, .. } => walk(lhs).or_else(|| walk(rhs)),
+            _ => None,
+        }
+    }
+    walk(expr).expect("expected a series in the expression")
+}
+
+// ----- percentile space aggregation ----------------------------------------
+
+#[test]
+fn test_should_parse_percentile_space_aggregation() {
+    let m = metric("avg(last_5m):p95:trace.http.server.request{service:rainmaker} > 1");
+    let series = first_series(&m.expr);
+    assert_eq!(series.space_aggregation, SpaceAgg::Percentile("95".into()));
+    assert_eq!(series.metric, "trace.http.server.request");
+}
+
+#[test]
+fn test_should_parse_fractional_percentile_with_percentile_head() {
+    // `percentile(...)` time-agg head + fractional `p99.9:` space agg.
+    let m = metric("percentile(last_10m):p99.9:tubi.sessions.lag{env:prod} by {table} > 5.5");
+    assert_eq!(m.time_aggregation.as_token(), "percentile");
+    let series = first_series(&m.expr);
+    assert_eq!(
+        series.space_aggregation,
+        SpaceAgg::Percentile("99.9".into())
+    );
+    assert_eq!(series.group_by, vec!["table"]);
+}
+
+#[test]
+fn test_should_treat_metric_named_like_percentile_as_a_metric() {
+    // `p50` without a following `:` is a metric segment, not a percentile.
+    let m = metric("avg(last_5m):p50.value{*} > 1");
+    let series = first_series(&m.expr);
+    assert_eq!(series.space_aggregation, SpaceAgg::Avg);
+    assert_eq!(series.metric, "p50.value");
+}
+
+// ----- spatial combiner: max(a, b) ------------------------------------------
+
+#[test]
+fn test_should_parse_spatial_combiner() {
+    let m = metric("avg(last_5m):max(avg:a.b{*}, avg:c.d{*}) > 1");
+    let MetricExpr::Combine { name, args } = &m.expr else {
+        panic!("expected a combine node, got {:?}", m.expr);
+    };
+    assert_eq!(name, "max");
+    assert_eq!(args.len(), 2);
+    assert!(matches!(args[0], MetricExpr::Series(_)));
+}
+
+// ----- transform with string args (moving_rollup) ---------------------------
+
+#[test]
+fn test_should_parse_moving_rollup_with_string_arg() {
+    let m = metric("sum(last_5m):moving_rollup(sum:a.b{*}.as_count(), 60, 'avg') >= 30");
+    let MetricExpr::Transform { name, args, .. } = &m.expr else {
+        panic!("expected a transform node, got {:?}", m.expr);
+    };
+    assert_eq!(name, "moving_rollup");
+    assert_eq!(args[0], ParamValue::Number(60.0));
+    assert_eq!(args[1], ParamValue::Str("avg".into()));
+}
+
+// ----- != comparison operator -----------------------------------------------
+
+#[test]
+fn test_should_parse_not_equal_operator() {
+    let m = metric("max(last_5m):max:k8s.deploy.replicas{env:prod} != 0");
+    assert_eq!(m.condition.operator, CmpOp::Ne);
+    assert_eq!(m.condition.critical.value, 0.0);
+}
+
+// ----- pct_change single-window shorthand -----------------------------------
+
+#[test]
+fn test_should_parse_pct_change_single_window_form() {
+    let m = metric("pct_change(last_30m):sum:tubi.grpc.handled{service:account}.as_rate() > 20");
+    let MetricExpr::Change { kind, shift, .. } = &m.expr else {
+        panic!("expected a change node, got {:?}", m.expr);
+    };
+    assert_eq!(*kind, ChangeKind::PctChange);
+    assert_eq!(shift.seconds, 1800);
+    assert_eq!(m.window.seconds, 1800);
+}
+
+// ----- window units: month + current_ --------------------------------------
+
+#[rstest]
+#[case("max(last_1mo):max:a.b{*} > 1", 2_592_000)]
+#[case("max(current_1d):max:a.b{*} > 1", 86_400)]
+#[case("max(last_1w):max:a.b{*} > 1", 604_800)]
+fn test_should_parse_extended_window_units(#[case] query: &str, #[case] expected_seconds: u64) {
+    let m = metric(query);
+    assert_eq!(m.window.seconds, expected_seconds);
 }

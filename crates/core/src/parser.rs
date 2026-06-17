@@ -73,9 +73,8 @@ impl<'a> Parser<'a> {
                     "logs" | "events" | "rum" | "error-tracking" => {
                         self.parse_search().map(MonitorQuery::Search)
                     }
-                    "avg" | "sum" | "min" | "max" | "count" | "change" | "pct_change" => {
-                        self.parse_metric().map(MonitorQuery::Metric)
-                    }
+                    "avg" | "sum" | "min" | "max" | "count" | "percentile" | "change"
+                    | "pct_change" => self.parse_metric().map(MonitorQuery::Metric),
                     "" => Err(self.cursor.error("unrecognized query")),
                     other => Err(self
                         .cursor
@@ -126,19 +125,36 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `change(avg(last_5m),last_1h): expr op threshold`.
+    /// `change(avg(last_5m),last_1h): expr op threshold`, or the shorthand
+    /// single-window form `pct_change(last_30m): expr op threshold` (no inner
+    /// aggregation; the window is both the evaluation window and the shift).
     fn parse_change_metric(&mut self, kind: ChangeKind) -> Result<MetricQuery, ParseError> {
         self.cursor.expect("(")?;
-        let inner = self.take_ident()?;
-        let inner_agg = TimeAgg::from_token(&inner).ok_or_else(|| {
-            self.cursor
-                .error(format!("invalid time aggregation `{inner}`"))
-        })?;
-        self.cursor.expect("(")?;
-        let window = self.take_window()?;
-        self.cursor.expect(")")?;
-        self.cursor.expect(",")?;
-        let shift = self.take_window()?;
+        // Distinguish the two forms by looking ahead: the full form opens with a
+        // time aggregation immediately followed by `(` (e.g. `avg(`); the
+        // shorthand opens with a bare window token (e.g. `last_30m`).
+        let mut probe = self.cursor.clone();
+        let head = probe.take_while(is_ident);
+        let is_full_form = TimeAgg::from_token(head).is_some() && probe.peek() == Some('(');
+
+        let (inner_agg, window, shift) = if is_full_form {
+            let inner = self.take_ident()?;
+            let inner_agg = TimeAgg::from_token(&inner).ok_or_else(|| {
+                self.cursor
+                    .error(format!("invalid time aggregation `{inner}`"))
+            })?;
+            self.cursor.expect("(")?;
+            let window = self.take_window()?;
+            self.cursor.expect(")")?;
+            self.cursor.expect(",")?;
+            let shift = self.take_window()?;
+            (inner_agg, window, shift)
+        } else {
+            // Shorthand: the single window serves as both evaluation window and
+            // comparison shift; there is no inner aggregation, so default it.
+            let window = self.take_window()?;
+            (TimeAgg::Avg, window.clone(), window)
+        };
         self.cursor.expect(")")?;
         self.cursor.expect(":")?;
         let inner_expr = self.parse_arith(0, 0)?;
@@ -202,6 +218,13 @@ impl<'a> Parser<'a> {
         if c.is_ascii_digit() || c == '+' || c == '-' || c == '.' {
             return Ok(MetricExpr::Scalar(Scalar::new(self.cursor.take_number()?)));
         }
+        // A percentile space aggregation (`p95:`, `p99.9:`) — handled before
+        // `take_ident`, which would otherwise split `p99.9` at the `.`.
+        if let Some(rank) = self.try_take_percentile_prefix() {
+            return Ok(MetricExpr::Series(
+                self.parse_series(SpaceAgg::Percentile(rank))?,
+            ));
+        }
         let id = self.take_ident()?;
         if let Some(func) = FuncKind::from_token(&id)
             && self.cursor.peek() == Some('(')
@@ -217,11 +240,39 @@ impl<'a> Parser<'a> {
             return Ok(MetricExpr::Series(self.parse_series(space_aggregation)?));
         }
         if self.cursor.peek() == Some('(') {
+            // `max(a, b)` / `min(…)` / `sum(…)` as a *series combiner* across
+            // multiple sub-expressions — distinct from a postfix transform like
+            // `rollup(60)`. Datadog uses these to combine series.
+            if SpaceAgg::from_token(&id).is_some() {
+                return self.parse_combiner(id, depth);
+            }
             return self.parse_transform(id, depth);
+        }
+        // A bare metric name with no `space_agg:` prefix, e.g.
+        // `aws.rds.cpuutilization{…}`. Datadog makes the space aggregation
+        // optional and defaults it to `avg`. The metric continues at a `.`
+        // (dotted name) or `{` (filter); anything else is a real error.
+        if matches!(self.cursor.peek(), Some('.' | '{')) {
+            let metric = self.continue_metric_name(id)?;
+            return Ok(MetricExpr::Series(
+                self.parse_series_from_metric(SpaceAgg::Avg, metric)?,
+            ));
         }
         Err(self
             .cursor
             .error(format!("expected `:` or `(` after `{id}`")))
+    }
+
+    /// `max(a, b, …)` — combine several sub-expressions under a spatial
+    /// aggregator. The opening identifier has been consumed; the `(` has not.
+    fn parse_combiner(&mut self, name: String, depth: usize) -> Result<MetricExpr, ParseError> {
+        self.cursor.expect("(")?;
+        let mut args = vec![self.parse_arith(0, depth + 1)?];
+        while self.cursor.eat(",") {
+            args.push(self.parse_arith(0, depth + 1)?);
+        }
+        self.cursor.expect(")")?;
+        Ok(MetricExpr::Combine { name, args })
     }
 
     fn parse_function(&mut self, name: FuncKind, depth: usize) -> Result<MetricExpr, ParseError> {
@@ -275,7 +326,9 @@ impl<'a> Parser<'a> {
         let arg = self.parse_arith(0, depth + 1)?;
         let mut args = Vec::new();
         while self.cursor.eat(",") {
-            args.push(Scalar::new(self.cursor.take_number()?));
+            // Transform args are mostly numeric (e.g. `rollup(60)`), but some
+            // are strings — e.g. `moving_rollup(expr, 60, 'avg', 'lookback')`.
+            args.push(self.parse_param_value()?);
         }
         self.cursor.expect(")")?;
         Ok(MetricExpr::Transform {
@@ -287,6 +340,17 @@ impl<'a> Parser<'a> {
 
     fn parse_series(&mut self, space_aggregation: SpaceAgg) -> Result<Series, ParseError> {
         let metric = self.take_metric_name()?;
+        self.parse_series_from_metric(space_aggregation, metric)
+    }
+
+    /// Parse the rest of a series (`{filter} by {tags}.modifiers`) given an
+    /// already-consumed space aggregation and metric name. Used both after a
+    /// `space_agg:` prefix and for the bare-metric (default-`avg`) form.
+    fn parse_series_from_metric(
+        &mut self,
+        space_aggregation: SpaceAgg,
+        metric: String,
+    ) -> Result<Series, ParseError> {
         let filter = if self.cursor.peek() == Some('{') {
             self.cursor.expect("{")?;
             let filters = self.parse_filter_list();
@@ -586,7 +650,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_cmp_op(&mut self) -> Result<CmpOp, ParseError> {
-        for op in [CmpOp::Ge, CmpOp::Le, CmpOp::Eq, CmpOp::Gt, CmpOp::Lt] {
+        for op in [
+            CmpOp::Ge,
+            CmpOp::Le,
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Gt,
+            CmpOp::Lt,
+        ] {
             if self.cursor.eat(op.as_token()) {
                 return Ok(op);
             }
@@ -621,6 +692,46 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
+    /// If the cursor is at a percentile space-aggregation prefix `p<rank>:`
+    /// (e.g. `p95:`, `p99.9:`), consume `p<rank>` (not the `:`) and return the
+    /// rank text. Otherwise consume nothing and return `None`.
+    ///
+    /// Needed because `take_ident` stops at the `.` in `p99.9`, so a fractional
+    /// percentile would not be recognized via the normal identifier path.
+    fn try_take_percentile_prefix(&mut self) -> Option<String> {
+        let rest = self.cursor.rest().trim_start();
+        // Must look like `p<digit…>` with an optional `.<digit…>`, terminated by
+        // `:` — the marker that distinguishes it from a metric named `p…`.
+        let body = rest.strip_prefix('p')?;
+        let bytes = body.as_bytes();
+        let mut len = 0;
+        while len < bytes.len() && bytes[len].is_ascii_digit() {
+            len += 1;
+        }
+        if len == 0 {
+            return None;
+        }
+        if bytes.get(len) == Some(&b'.') {
+            let mut frac = len + 1;
+            while frac < bytes.len() && bytes[frac].is_ascii_digit() {
+                frac += 1;
+            }
+            if frac > len + 1 {
+                len = frac;
+            }
+        }
+        // Only a percentile if a `:` follows; else `p5` could be a metric name.
+        if !body[len..].trim_start().starts_with(':') {
+            return None;
+        }
+        let rank = body[..len].to_string();
+        // Commit: advance the real cursor past `p<rank>` and the `:`.
+        self.cursor.eat("p");
+        self.cursor.take_while(|c| c.is_ascii_digit() || c == '.');
+        self.cursor.eat(":");
+        Some(rank)
+    }
+
     fn take_ident(&mut self) -> Result<String, ParseError> {
         let id = self.cursor.take_while(is_ident);
         if id.is_empty() {
@@ -641,7 +752,13 @@ impl<'a> Parser<'a> {
         if first.is_empty() {
             return Err(self.cursor.error("expected a metric name"));
         }
-        let mut name = first.to_string();
+        self.continue_metric_name(first.to_string())
+    }
+
+    /// Continue a dotted metric name whose first segment was already consumed
+    /// (e.g. via `take_ident` for the bare, prefix-less form).
+    fn continue_metric_name(&mut self, first: String) -> Result<String, ParseError> {
+        let mut name = first;
         loop {
             if !self.cursor.rest().starts_with('.') {
                 break;

@@ -153,6 +153,7 @@ fn time_agg_word(agg: TimeAgg) -> &'static str {
         TimeAgg::Min => "minimum",
         TimeAgg::Max => "maximum",
         TimeAgg::Count => "count",
+        TimeAgg::Percentile => "percentile",
     }
 }
 
@@ -191,6 +192,10 @@ fn describe_expr(expr: &MetricExpr) -> String {
         }
         MetricExpr::Transform { name, arg, .. } => {
             format!("{} of {}", humanize_transform(name), describe_expr(arg))
+        }
+        MetricExpr::Combine { name, args } => {
+            let parts: Vec<String> = args.iter().map(describe_expr).collect();
+            format!("{name} of ({})", parts.join(", "))
         }
         MetricExpr::Arith { op, lhs, rhs } => {
             format!(
@@ -360,6 +365,7 @@ fn cmp_symbol(op: CmpOp) -> &'static str {
         CmpOp::Ge => "≥",
         CmpOp::Le => "≤",
         CmpOp::Eq => "=",
+        CmpOp::Ne => "≠",
         CmpOp::Gt => ">",
         CmpOp::Lt => "<",
     }
@@ -441,6 +447,7 @@ fn first_series(expr: &MetricExpr) -> Option<&Series> {
         | MetricExpr::Transform { arg, .. }
         | MetricExpr::Change { arg, .. } => first_series(arg),
         MetricExpr::Arith { lhs, rhs, .. } => first_series(lhs).or_else(|| first_series(rhs)),
+        MetricExpr::Combine { args, .. } => args.iter().find_map(first_series),
         MetricExpr::Scalar(_) => None,
     }
 }
