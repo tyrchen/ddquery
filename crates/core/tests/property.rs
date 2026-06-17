@@ -53,4 +53,24 @@ proptest! {
             prop_assert_eq!(ast, back);
         }
     }
+
+    /// `QuerySummary` (what consumers persist) must also round-trip — including
+    /// non-negated scope chips, whose `negated:false` is omitted on serialize and
+    /// so must deserialize from an absent field. Regression for a stored summary
+    /// failing to load with `missing field negated`.
+    #[test]
+    fn prop_summary_roundtrips_json(
+        neg in any::<bool>(),
+        key in "[a-z]{1,8}",
+        val in "[a-z0-9]{1,8}",
+    ) {
+        let bang = if neg { "!" } else { "" };
+        let query = format!("avg(last_5m):avg:app.metric{{{bang}{key}:{val}}} > 1");
+        if let Ok(ast) = parse(&query) {
+            let summary = summarize(&ast, &query);
+            let json = serde_json::to_string(&summary).unwrap();
+            let back: ddquery_core::QuerySummary = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(summary, back);
+        }
+    }
 }

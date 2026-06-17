@@ -52,7 +52,12 @@ pub struct KeyVal {
     /// The tag value.
     pub value: String,
     /// Whether the filter is negated (`!key:value`).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    ///
+    /// `default` pairs with `skip_serializing_if`: the field is omitted from JSON
+    /// when `false`, so deserialization must also tolerate its absence — otherwise
+    /// a serialize→deserialize round-trip of a non-negated filter fails with
+    /// `missing field negated`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub negated: bool,
 }
 
